@@ -8,6 +8,7 @@
 # This source code is licensed under a BSD-style license (found in the
 # LICENSE file in the root directory of this source tree)
 #######################################################################
+import msgpack
 import numpy as np
 from libc.stdlib cimport malloc, free
 from libcpp cimport bool
@@ -56,6 +57,31 @@ cdef extern from "blosc2.h":
 
     ctypedef int *blosc2_prefilter_fn
     ctypedef struct blosc2_prefilter_params
+    ctypedef int *blosc2_postfilter_fn
+    ctypedef struct blosc2_postfilter_params
+
+    ctypedef struct blosc2_cparams:
+        uint8_t compcode
+        uint8_t compcode_meta
+        uint8_t clevel
+        int use_dict
+        int32_t typesize
+        int16_t nthreads
+        int32_t blocksize
+        int32_t splitmode
+        void * schunk
+        uint8_t filters[BLOSC2_MAX_FILTERS]
+        uint8_t filters_meta[BLOSC2_MAX_FILTERS]
+        blosc2_prefilter_fn prefilter
+        blosc2_prefilter_params * preparams
+        blosc2_btune *udbtune
+
+    ctypedef struct blosc2_dparams:
+        int nthreads
+        void * schunk
+        blosc2_postfilter_fn postfilter
+        blosc2_postfilter_params *postparams
+
     ctypedef struct blosc2_storage
     ctypedef struct blosc2_btune
     ctypedef struct blosc2_context
@@ -96,6 +122,21 @@ cdef extern from "blosc2.h":
                                     uint32_t content_len)
     int blosc2_meta_get(blosc2_schunk *schunk, const char *name, uint8_t ** content,
                     uint32_t *content_len)
+
+    ctypedef int(*blosc2_codec_encoder_cb)(const uint8_t *input, int32_t input_len, uint8_t *output, int32_t output_len,
+                                          uint8_t meta, blosc2_cparams *cparams);
+    ctypedef int(*blosc2_codec_decoder_cb)(const uint8_t *input, int32_t input_len, uint8_t *output, int32_t output_len,
+                                          uint8_t meta, blosc2_dparams *dparams);
+
+    ctypedef struct blosc2_codec:
+        uint8_t compcode;
+        char * compname;
+        uint8_t complib;
+        uint8_t compver;
+        blosc2_codec_encoder_cb encoder;
+        blosc2_codec_decoder_cb decoder;
+
+    int blosc2_register_codec(blosc2_codec * codec);
 
 
 
@@ -200,6 +241,7 @@ cdef extern from "caterva.h":
 # Defaults for compression params
 config_dflts = {
     'codec': Codec.LZ4,
+    'codecmeta': 0,
     'clevel': 5,
     'usedict': False,
     'nthreads': 1,
@@ -227,7 +269,7 @@ cdef class Context:
         config.free = free
         config.alloc = malloc
         config.compcodec = kwargs.get('codec', config_dflts['codec']).value
-        config.compmeta = 0
+        config.compmeta = kwargs.get('codecmeta', config_dflts['codecmeta'])
         config.complevel = kwargs.get('clevel', config_dflts['clevel'])
         config.splitmode = BLOSC_AUTO_SPLIT
         config.usedict =  kwargs.get('usedict', config_dflts['usedict'])
@@ -609,3 +651,149 @@ def meta_keys(self):
         name = arr.sc.metalayers[i].name.decode("utf-8")
         keys.append(name)
     return keys
+
+
+# AACODEC
+
+import ctypes
+import archetypes as arch
+
+def split(array: np.ndarray, tile: tuple):
+    height, width = array.shape
+    t_height, t_width = tile
+
+    tiled_array = array.reshape((height // t_height, t_height,
+                                width // t_width, t_width))
+    tiled_array = tiled_array.swapaxes(1, 2)
+    return tiled_array.reshape(array.shape)
+
+
+def split_backward(array: np.ndarray, tile: tuple):
+    height, width = array.shape
+    t_height, t_width = tile
+
+    tiled_array = array.reshape((height // t_height,
+                                 width // t_width,
+                                 t_height,
+                                 t_width))
+
+    tiled_array = tiled_array.swapaxes(2, 1)
+    return tiled_array.reshape(array.shape)
+
+
+def quantizer(data):
+    data = (np.digitize(data, np.linspace(0, 1, 256)) - 1)
+    data = data.astype(np.uint8)
+    return data
+
+from dataclasses import dataclass
+
+@dataclass
+class CatervaMeta:
+    version: int
+    ndim: int
+    shape: list
+    chunks: list
+    blocks: list
+
+    def __init__(self, version, ndim, shape, chunks, blocks):
+        self.version = version
+        self.ndim = ndim
+        self.shape = shape
+        self.chunks = chunks
+        self.blocks = blocks
+
+
+cdef get_caterva_metalayer(blosc2_schunk *sc):
+    name = "caterva".encode("utf8")
+    cdef uint8_t *metalayer
+    cdef uint32_t metalayer_len
+    blosc2_meta_get(sc, <char *> name, &metalayer, &metalayer_len)
+    cdef uint8_t [:] meta= <uint8_t[:metalayer_len]> metalayer
+    version, ndim, shape, chunks, blocks = msgpack.unpackb(memoryview(meta))
+    return CatervaMeta(version, ndim, shape, chunks, blocks)
+
+# Encoder
+cdef int encoder(const uint8_t *input, int32_t input_len, uint8_t *output,
+             int32_t output_len, uint8_t meta, blosc2_cparams *cparams) with gil:
+    cdef blosc2_schunk *sc = <blosc2_schunk *> cparams.schunk
+    meta_caterva = get_caterva_metalayer(sc)
+
+    dtype = np.float64 if cparams.typesize == 8 else np.float32
+
+    cdef uint8_t [:] input_ = <uint8_t[:input_len]> input
+    ndinput = np.frombuffer(bytes(input_), dtype=dtype).reshape(meta_caterva.blocks)
+    ndinput = split(ndinput, (4, 4))
+
+    cdef uint8_t [:] output_ = <uint8_t[:output_len]> output
+    mvoutput = memoryview(output_)
+
+    narch = meta
+
+    size = 4 * 4
+
+    mvoutput[0] = narch
+    mvoutput[1] = size
+    mvoutput[2] = ndinput.dtype.itemsize
+
+    aa = arch.AA(n_archetypes=narch, n_init=1, max_iter=100)
+
+    ndinput = ndinput.reshape(-1, size)
+    data_trans = aa.fit_transform(ndinput)
+    data_trans = quantizer(data_trans)
+
+    archetypes = aa.archetypes_
+    archetypes_ind = 3
+    mvoutput[archetypes_ind: archetypes_ind + archetypes.nbytes] = bytes(archetypes)
+    data_trans_ind = archetypes_ind + archetypes.nbytes
+
+    mvoutput[data_trans_ind: data_trans_ind + data_trans.nbytes] = bytes(data_trans)
+
+    return data_trans_ind + data_trans.nbytes
+
+
+cdef int decoder(const uint8_t *input, int32_t input_len, uint8_t *output,
+             int32_t output_len, uint8_t meta, blosc2_dparams *dparams) with gil:
+    cdef blosc2_schunk *sc = <blosc2_schunk *> dparams.schunk
+    meta_caterva = get_caterva_metalayer(sc)
+
+    cdef uint8_t [:] input_ = <uint8_t[:input_len]> input
+    mvinput = memoryview(input_)
+
+    cdef uint8_t [:] output_ = <uint8_t[:output_len]> output
+    mvoutput = memoryview(output_)
+
+    narch = mvinput[0]
+    size = mvinput[1]
+    itemsize = mvinput[2]
+    dtype = np.float32 if itemsize == 4 else np.float64
+
+    archetypes_start = 3
+    data_trans_start = archetypes_start + narch * size * 8
+    archetypes = np.asarray(mvinput[archetypes_start: data_trans_start]).view(np.float64).reshape(narch, size)
+
+    data_trans = ((np.asarray(mvinput[data_trans_start:], dtype=dtype) + 1) / 255).reshape(-1, narch)
+    data_trans /= data_trans.sum(1)[:, None]
+
+    res = (data_trans @ archetypes).reshape(meta_caterva.blocks)
+    res = split_backward(res, (4, 4))
+    mvoutput[:] = bytes(res)
+
+    return res.nbytes
+
+
+AACODEC = 230
+
+def register_archetypes_codec():
+    cdef blosc2_codec arch_codec
+    arch_codec.compcode = AACODEC
+    compname = "archetypal analysis codec".encode("utf-8")
+    arch_codec.compname = compname
+    arch_codec.complib = 1
+    arch_codec.compver = 1
+    arch_codec.decoder = decoder
+    arch_codec.encoder = encoder
+
+    blosc2_register_codec(&arch_codec)
+
+    return 0

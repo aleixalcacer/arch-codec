@@ -47,6 +47,8 @@ def empty(shape, itemsize, **kwargs):
 
             codec: :py:class:`Codec`
                 The name for the compressor codec.  (Default: :py:attr:`Codec.LZ4`)
+            codecmeta: (0 to 255)
+                Information about the codec (Default: 0)
             clevel: int (0 to 9)
                 The compression level.  0 means no compression, and 9 maximum compression.
                 (Default: 5)
