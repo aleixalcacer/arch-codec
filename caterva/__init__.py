@@ -17,3 +17,7 @@ from .constructors import (empty, zeros, full, from_buffer, open, asarray, copy)
 from .ndarray import NDArray
 
 from .utils import Codec, Filter, remove
+
+from .caterva_ext import register_archetypes_codec
+register_archetypes_codec()
+
