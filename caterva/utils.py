@@ -20,6 +20,7 @@ class Codec(Enum):
     LZ4HC = 2
     ZLIB = 4
     ZSTD = 5
+    AACODEC = 230
 
 
 class Filter(Enum):
