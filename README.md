@@ -4,15 +4,11 @@
 
 # python-caterva
 
-Python wrapper for [Caterva](https://caterva.readthedocs.io).
+Python wrapper for [Caterva](https://caterva.readthedocs.io) with a new codec called AACODEC that is based on 
+archetypal analysis.
+
 
 ## Install
-
-```sh
-pip install caterva
-```
-
-## Development Workflow
 
 ### Clone repo and submodules
 
@@ -45,3 +41,8 @@ PYTHONPATH=. pytest
 ```sh
 python -m pip install .
 ```
+
+## AACODEC
+
+See this [file](doc/source/development/aacodec-report.md) to find more information about AACODEC.
+
